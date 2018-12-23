@@ -1,22 +1,94 @@
 require 'net/http'
 require 'json'
 require 'nokogiri'
+require 'rubygems'
+require 'mechanize'
 
 
-def yandex_translate(text)
-  text = text.gsub(/[^[:ascii:]]/, '')
-  key = 'trnsl.1.1.20181222T190255Z.5f681e8011285a14.931279157d16121692edf18e8ad5665d98b55e84'
-  uri = URI("https://translate.yandex.net/api/v1.5/tr.json/translate?key=#{key}&text=#{text}&lang=ru")
-  response = JSON.parse(Net::HTTP.get(uri))
-  response['text'][0]
+class YandexTranslate
+  def initialize(key)
+    @key = key
+  end
+
+  def translate(text)
+    text = text.gsub(/[^[:ascii:]]/, '')
+    uri = URI("https://translate.yandex.net/api/v1.5/tr.json/translate?key=#{@key}&text=#{text}&lang=ru")
+    response = JSON.parse(Net::HTTP.get(uri))
+    response['text'][0]
+  end
 end
 
-def google_translate(text)
-  text = text.gsub(/[^[:ascii:]]/, '')
-  uri = URI("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=#{text}")
-  response = JSON.parse(Net::HTTP.get(uri))
-  response[0][0][0]
+
+class GoogleTranslate
+  def initialize(proxies, calls_per_proxy)
+    @proxies = proxies
+    @calls_per_proxy = calls_per_proxy
+    @current_proxy_ind = 0
+    @calls_counter = 0
+    @agent = Mechanize.new
+    @agent.keep_alive = false
+    @agent.open_timeout = 10
+    @agent.read_timeout = 10
+    set_proxy
+  end
+
+  def set_proxy
+    host, port = @proxies[@current_proxy_ind]
+    @agent.set_proxy host, port
+  end
+
+  def round_robin_proxy
+    @calls_counter += 1
+    return if @calls_counter < @calls_per_proxy - 1
+
+    next_proxy
+  end
+
+  def next_proxy
+    @calls_counter = 0
+    @current_proxy_ind = @current_proxy_ind < @proxies.length - 2 ? @current_proxy_ind + 1 : 0
+    set_proxy
+  end
+
+  def translate(text)
+    text = text.gsub(/[^[:ascii:]]/, '')
+    data = nil
+
+    while true
+      begin
+        page = @agent.get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=#{text}")
+        response = JSON.parse(page.body)
+        p response
+        data = response[0][0][0]
+        break
+      rescue => e
+        p "#{e}, proxy_id#{@current_proxy_ind}"
+
+        if @current_proxy_ind == @proxies.length - 1
+          uri = URI("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=#{text}")
+          response = JSON.parse(Net::HTTP.get(uri))
+          data = response[0][0][0]
+          break
+        end
+
+        next_proxy
+      end
+    end
+    p "proxy_id: #{@current_proxy_ind}"
+    round_robin_proxy
+
+    data
+  end
 end
+
+proxies = []
+
+File.readlines('proxies.txt').each do |line|
+  parts = line.split(',')
+  proxies.push([parts[0].strip, parts[1].strip])
+end
+
+translator = GoogleTranslate.new(proxies, 10)
 
 if ARGV.length < 2
   puts "Too few arguments"
@@ -37,7 +109,7 @@ iter_to = paragraphs.length - 1
   emphasis_node = Nokogiri::XML::Node.new 'emphasis', doc
   translated_p.add_child emphasis_node
   empty_line = Nokogiri::XML::Node.new 'empty-line', doc
-  emphasis_node.content = google_translate(paragraphs[i].content)
+  emphasis_node.content = translator.translate(paragraphs[i].content)
   paragraphs[i].add_next_sibling(empty_line)
   paragraphs[i].add_next_sibling(translated_p)
   p i * 100 / iter_to.to_f
