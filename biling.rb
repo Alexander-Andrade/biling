@@ -20,16 +20,23 @@ end
 
 
 class GoogleTranslate
+  attr_reader :proxy_stat
+
   def initialize(proxies, calls_per_proxy)
     @proxies = proxies
     @calls_per_proxy = calls_per_proxy
     @current_proxy_ind = 0
     @calls_counter = 0
     @agent = Mechanize.new
+    @proxy_stat = Hash.new { |hash, key| hash[key] = { hits: 0, misses: 0 } }
+    init_proxy
+    set_proxy
+  end
+
+  def init_proxy
     @agent.keep_alive = false
     @agent.open_timeout = 10
     @agent.read_timeout = 10
-    set_proxy
   end
 
   def set_proxy
@@ -58,11 +65,16 @@ class GoogleTranslate
       begin
         page = @agent.get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=#{text}")
         response = JSON.parse(page.body)
-        p response
-        data = response[0][0][0]
+
+        @proxy_stat[@current_proxy_ind][:hits] += 1
+
+        data = response[0].map { |res| res[0] }.join
+        p data
         break
       rescue => e
-        p "#{e}, proxy_id#{@current_proxy_ind}"
+        p "#{e}, proxy_id: #{@current_proxy_ind}"
+
+        @proxy_stat[@current_proxy_ind][:misses] += 1
 
         if @current_proxy_ind == @proxies.length - 1
           uri = URI("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=#{text}")
@@ -95,6 +107,7 @@ if ARGV.length < 2
   exit
 end
 
+
 file_to_translate = ARGV[0]
 result_file = ARGV[1]
 service = ARGV[2] || 'google'
@@ -103,7 +116,6 @@ doc = File.open(file_to_translate) { |f| Nokogiri::XML(f) }
 paragraphs = doc.css('p')
 
 iter_to = paragraphs.length - 1
-
 (0..iter_to).each do |i|
   translated_p = Nokogiri::XML::Node.new 'p', doc
   emphasis_node = Nokogiri::XML::Node.new 'emphasis', doc
@@ -112,8 +124,8 @@ iter_to = paragraphs.length - 1
   emphasis_node.content = translator.translate(paragraphs[i].content)
   paragraphs[i].add_next_sibling(empty_line)
   paragraphs[i].add_next_sibling(translated_p)
+  p translator.proxy_stat if i % 20 == 0
   p i * 100 / iter_to.to_f
-  sleep(0.1)
 end
 
 File.write(result_file, doc.to_xml)
