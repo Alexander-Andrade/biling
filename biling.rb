@@ -116,7 +116,9 @@ class Bilingual
       # p results
       batch -= success_ids
 
-      success_ids.each { |node_ind| add_translation_node(results[node_ind], paragraphs[node_ind], doc) }
+      result_success_ids.zip(success_ids).each do |result_id, node_ind|
+        add_translation_node(results[result_id], paragraphs[node_ind], doc)
+      end
 
       new_node_ind = next_node_ind(node_ind, @batch_size, batch.length, iter_to)
       batch += (node_ind...new_node_ind).to_a
