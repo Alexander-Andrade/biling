@@ -3,40 +3,26 @@ require 'json'
 require 'nokogiri'
 require 'rubygems'
 require 'mechanize'
-
-
-class YandexTranslate
-  def initialize(key)
-    @key = key
-  end
-
-  def translate(text)
-    text = text.gsub(/[^[:ascii:]]/, '')
-    uri = URI("https://translate.yandex.net/api/v1.5/tr.json/translate?key=#{@key}&text=#{text}&lang=ru")
-    response = JSON.parse(Net::HTTP.get(uri))
-    response['text'][0]
-  end
-end
+require 'parallel'
+require 'timeout'
 
 
 class GoogleTranslate
-  attr_reader :proxy_stat
+  attr_reader :current_proxy_ind
 
-  def initialize(proxies, calls_per_proxy)
+  def initialize(proxies, timeout = 7)
     @proxies = proxies
-    @calls_per_proxy = calls_per_proxy
+    @timeout = timeout
     @current_proxy_ind = 0
-    @calls_counter = 0
     @agent = Mechanize.new
-    @proxy_stat = Hash.new { |hash, key| hash[key] = { hits: 0, misses: 0 } }
+
     init_proxy
-    set_proxy
   end
 
   def init_proxy
     @agent.keep_alive = false
-    @agent.open_timeout = 10
-    @agent.read_timeout = 10
+    @agent.open_timeout = @timeout
+    @agent.read_timeout = @timeout
   end
 
   def set_proxy
@@ -44,88 +30,115 @@ class GoogleTranslate
     @agent.set_proxy host, port
   end
 
-  def round_robin_proxy
-    @calls_counter += 1
-    return if @calls_counter < @calls_per_proxy - 1
-
-    next_proxy
-  end
-
-  def next_proxy
-    @calls_counter = 0
-    @current_proxy_ind = @current_proxy_ind < @proxies.length - 2 ? @current_proxy_ind + 1 : 0
+  def random_proxy
+    @current_proxy_ind = Random.rand(@proxies.length)
     set_proxy
   end
 
   def translate(text)
     text = text.gsub(/[^[:ascii:]]/, '')
     data = nil
-
-    while true
-      begin
+    page = nil
+    begin
+      Timeout::timeout(@timeout) do
         page = @agent.get("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=#{text}")
-        response = JSON.parse(page.body)
-
-        @proxy_stat[@current_proxy_ind][:hits] += 1
-
-        data = response[0].map { |res| res[0] }.join
-        p data
-        break
-      rescue => e
-        p "#{e}, proxy_id: #{@current_proxy_ind}"
-
-        @proxy_stat[@current_proxy_ind][:misses] += 1
-
-        if @current_proxy_ind == @proxies.length - 1
-          uri = URI("https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=ru&dt=t&q=#{text}")
-          response = JSON.parse(Net::HTTP.get(uri))
-          data = response[0][0][0]
-          break
-        end
-
-        next_proxy
       end
+      response = JSON.parse(page.body)
+      data = response[0].map { |res| res[0] }.join
+    rescue => e
+      # p e
     end
-    p "proxy_id: #{@current_proxy_ind}"
-    round_robin_proxy
 
     data
   end
 end
 
-proxies = []
 
-File.readlines('proxies.txt').each do |line|
-  parts = line.split(',')
-  proxies.push([parts[0].strip, parts[1].strip])
+class Bilingual
+  def initialize(file_to_translate, result_file, batch_size = 16)
+    @file_to_translate = file_to_translate
+    @result_file = result_file
+    @batch_size = batch_size
+    @proxies = proxies_list
+    @translators = (0...@batch_size).map { |_| GoogleTranslate.new(@proxies) }
+  end
+
+  def add_translation_node(translation, node, doc)
+    translated_p = Nokogiri::XML::Node.new 'p', doc
+    emphasis_node = Nokogiri::XML::Node.new 'emphasis', doc
+    translated_p.add_child emphasis_node
+    empty_line = Nokogiri::XML::Node.new 'empty-line', doc
+    emphasis_node.content = translation
+    node.add_next_sibling(empty_line)
+    node.add_next_sibling(translated_p)
+  end
+
+  def proxies_list
+    File.readlines('proxies.txt').map do |line|
+      parts = line.split(':')
+      [parts[0].strip, parts[1].strip]
+    end
+  end
+
+  def next_node_ind(node_ind, batch_size, cur_batch_size, iter_to)
+    if node_ind + batch_size < iter_to
+      node_ind + batch_size - cur_batch_size
+    elsif node_ind < iter_to
+      node_ind + iter_to - node_ind
+    else
+      node_ind
+    end
+  end
+
+  def run
+    doc = File.open(@file_to_translate) { |f| Nokogiri::XML(f) }
+    paragraphs = doc.css('p')
+
+    iter_to = paragraphs.length - 1
+    batch = (0...@batch_size).to_a
+    node_ind = @batch_size
+
+    until batch.empty?
+      @translators.each(&:random_proxy)
+      # p "proxies: #{@translators.map(&:current_proxy_ind)}"
+      start = Time.now
+      results = Parallel.map(batch, in_threads: @batch_size) do |node_ind|
+        t = @translators[node_ind % @batch_size].translate(paragraphs[node_ind].content)
+        # p "translator: #{node_ind % @batch_size} node_id: #{node_ind} text: #{paragraphs[node_ind].content}, translation: #{t}"
+        # t
+      end
+      p "time: #{Time.now - start}"
+
+      result_success_ids = results.each_index.select { |i| results[i].is_a? String }
+      success_ids = batch.values_at(*result_success_ids)
+      p batch
+      p success_ids
+      # p results
+      batch -= success_ids
+
+      success_ids.each { |node_ind| add_translation_node(results[node_ind], paragraphs[node_ind], doc) }
+
+      new_node_ind = next_node_ind(node_ind, @batch_size, batch.length, iter_to)
+      batch += (node_ind...new_node_ind).to_a
+      node_ind = new_node_ind
+
+      p node_ind * 100 / iter_to.to_f
+    end
+
+    File.write(@result_file, doc.to_xml)
+  end
 end
 
-translator = GoogleTranslate.new(proxies, 10)
 
 if ARGV.length < 2
   puts "Too few arguments"
   exit
 end
 
-
 file_to_translate = ARGV[0]
 result_file = ARGV[1]
 service = ARGV[2] || 'google'
 
-doc = File.open(file_to_translate) { |f| Nokogiri::XML(f) }
-paragraphs = doc.css('p')
 
-iter_to = paragraphs.length - 1
-(0..iter_to).each do |i|
-  translated_p = Nokogiri::XML::Node.new 'p', doc
-  emphasis_node = Nokogiri::XML::Node.new 'emphasis', doc
-  translated_p.add_child emphasis_node
-  empty_line = Nokogiri::XML::Node.new 'empty-line', doc
-  emphasis_node.content = translator.translate(paragraphs[i].content)
-  paragraphs[i].add_next_sibling(empty_line)
-  paragraphs[i].add_next_sibling(translated_p)
-  p translator.proxy_stat if i % 20 == 0
-  p i * 100 / iter_to.to_f
-end
-
-File.write(result_file, doc.to_xml)
+bilingual = Bilingual.new(file_to_translate, result_file, 16)
+bilingual.run
